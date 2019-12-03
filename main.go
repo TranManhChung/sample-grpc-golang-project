@@ -17,7 +17,8 @@ import (
 )
 
 const (
-	port = ":56789"
+	port      = ":56789"
+	maxWorker = 8
 )
 
 var queueJob chan string
@@ -26,19 +27,33 @@ type server struct{}
 
 // SampleAPI ...
 func (s *server) SampleAPI(ctx context.Context, req *sample.SampleReq) (*sample.SampleRes, error) {
-	time.Sleep(1 * time.Second)
 	queueJob <- req.Mess
 	return &sample.SampleRes{Data: &sample.SampleRes_Data{Data: req.Mess}}, nil
 }
 
 func main() {
-	queueJob = make(chan string, 10)
-	for i := 0; i < 8; i++ {
-		go func() {
-			for j := range queueJob {
-				fmt.Println(j)
+	done := make(chan bool, 1)
+	var stopSig []chan bool
+
+	queueJob = make(chan string, 100)
+	var job string
+	for i := 0; i < maxWorker; i++ {
+		a := make(chan bool, 1)
+		stopSig = append(stopSig, a)
+		go func(i int) {
+			for {
+				time.Sleep(1 * time.Second)
+				select {
+				case job = <-queueJob:
+					fmt.Println(job)
+				case stop := <-done:
+					if stop == false && len(queueJob) == 0 {
+						stopSig[i] <- true
+						return
+					}
+				}
 			}
-		}()
+		}(i)
 	}
 
 	lis, err := net.Listen("tcp", port)
@@ -47,22 +62,22 @@ func main() {
 	}
 	s := grpc.NewServer()
 	sample.RegisterSampleServiceServer(s, &server{})
-
 	reflection.Register(s)
-
 	sigs := make(chan os.Signal, 1)
-	done := make(chan bool, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		if err := s.Serve(lis); err != nil {
 			log.Fatalf("failed to serve: %v", err)
 		}
-		fmt.Println("Server now listening")
 	}()
 	go func() {
 		<-sigs
-		done <- true
+		s.Stop()
+		close(done)
 	}()
 	fmt.Println("Ctrl-C to interrupt...")
-	<-done
+	for i := 0; i < maxWorker; i++ {
+		<-stopSig[i]
+	}
+
 }
